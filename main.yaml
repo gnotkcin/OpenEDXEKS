@@ -1,0 +1,145 @@
+---
+  - name: EKS Cluster Setup
+    hosts: localhost
+    vars_prompt:
+      - name: LMS_HOST
+        prompt: Your website domain name for students (LMS)
+        private: no
+      - name: CMS_HOST
+        prompt: Your website domain name for teachers (CMS)
+        private: no
+      - name: PLATFORM_NAME
+        prompt: Your platform name/title
+        private: no
+      - name: CONTACT_EMAIL
+        prompt: Your public contact email address
+        private: no
+      - name: ROUTE53_HZ
+        prompt: Route53 hosted zone
+        private: no
+    tasks:
+
+    - name: Checking pre-requisite installations
+      shell: ./scripts/check_requirements.sh {{ item }}
+      with_items: ['eksctl','aws','tutor']
+      tags: 
+        - check_requirements
+        - eks_setup
+
+    - name: Deploy AWS EKS Cluster Control Plane
+      shell:
+        eksctl create cluster --name openedx --version 1.18 --region us-east-1
+      tags:
+        - cluster_deploy
+        - eks_setup
+    - name: Set kube configuration
+      shell:
+        aws eks --region us-east-1 update-kubeconfig --name openedx
+      tags:
+        - cluster_deploy
+        - eks_setup
+
+    - name: Deploy NodeGroup on AWS EKS Cluster
+      shell:
+        eksctl create nodegroup --cluster openedx --region us-east-1 --name edxnodes --node-type t2.medium --nodes 3 --nodes-min 3 --nodes-max 4 --node-volume-size 25 --managed --alb-ingress-access
+      tags:
+        - node_deploy
+        - eks_setup
+
+    - name: Setting up IAM OpenID Connect Provider
+      shell:
+        eksctl utils associate-iam-oidc-provider --region us-east-1 --cluster openedx --approve
+      tags:
+        - ingress_controller
+        - ingress_iam
+    
+    - name: Create IAM Policy
+      shell:
+        aws iam create-policy --policy-name ALBIngressControllerIAMPolicy --policy-document https://raw.githubusercontent.com/kubernetes-sigs/aws-alb-ingress-controller/v1.1.4/docs/examples/iam-policy.json
+      tags:
+        - ingress_controller
+        - ingress_iam
+    
+    - name: Create Cluster Role and Service Account
+      k8s:
+        state: present
+        src: templates/rbac-role.yaml
+      tags:
+        - ingress_controller
+        - ingress_iam
+    
+    - name: Creating IAM Service Account and attaching Policy
+      shell: |
+        AccNo=`aws sts get-caller-identity --query Account`;
+        eksctl create iamserviceaccount --region us-east-1 --name alb-ingress-controller --namespace kube-system --cluster openedx --attach-policy-arn arn:aws:iam::${AccNo//\"/}:policy/ALBIngressControllerIAMPolicy --override-existing-serviceaccounts --approve
+      tags:
+        - ingress_controller
+        - ingress_iam
+    
+    - name: Edit Ingress Controller
+      shell: |
+        VpcId=`aws eks describe-cluster --name openedx --query cluster.resourcesVpcConfig.vpcId`;
+        VpcId=${VpcId//\"/};
+        sed "s/_VPC_ID_/$VpcId/" templates/alb-ingress-controller.yaml > templates/alb-ingress-controller-out.yaml;
+      tags:
+        - ingress_controller
+        - ingress_deployment
+    - name: Deploy Ingress Controller
+      k8s:
+        state: present
+        src: templates/alb-ingress-controller-out.yaml
+      tags:
+        - ingress_controller
+        - ingress_deployment
+
+    - name: Save Tutor Configurations
+      shell: 
+        printf '{{ LMS_HOST }}\n{{ CMS_HOST }}\n{{ PLATFORM_NAME }}\n{{ CONTACT_EMAIL }}\nen\nN' | tutor config save --interactive
+      tags:
+        - tutor
+        - tutor_config
+        - tutor_pre
+
+    - name: Run all configured Open edX services
+      shell: 
+        tutor k8s start
+      tags:
+        - tutor
+        - tutor_pre
+    
+    - name: Annotate ingress to create ALB
+      shell: |
+        status="";
+        while [[ $status != "web" ]];
+        do
+          status=$(kubectl get -n openedx ingress.extensions/web | awk '{print $1}' | grep web);
+        done;
+        kubectl annotate ingress.extensions/web -n openedx kubernetes.io/ingress.class=alb alb.ingress.kubernetes.io/scheme=internet-facing
+      tags:
+        - tutor
+        - dns_config
+
+    # - name: Create Route 53 hosted zone
+    #   shell:
+    #     aws route53 create-hosted-zone --name {{ ROUTE53_HZ }} --caller-reference "open_edx" --query HostedZone.Id
+    #   register: HZ_ID
+    #   tags:
+    #     - tutor
+    #     - dns_config
+    - name: Create Route 53 record set
+      shell: |
+        ALB_DNS_NAME=$(kubectl get -n openedx ingress.extensions/web | awk 'FNR == 1 {print $3}');
+        HZ_ID=$(aws route53 list-hosted-zones --query 'HostedZones[?CallerReference==`open_edx`].Id');
+        HZ_ID=$(echo $HZ_ID | tr -d []\");
+        sed -e "s/_LMS_HOST_/{{ LMS_HOST }}/g" -e "s/_ALB_DNS_/$ALB_DNS_NAME/" templates/record_set.json > templates/record_set_out.json;
+        aws route53 change-resource-record-sets --hosted-zone-id ${HZ_ID} --change-batch templates/record_set_out.json    
+      tags:
+        - tutor
+        - dns_config
+
+    - name: Initialize all applications
+      shell:
+        tutor k8s init
+      tags:
+        - tutor
+        - tutor_post
